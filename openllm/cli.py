@@ -1,7 +1,6 @@
 """Command line entry point: catalog, picker, download, chat."""
 
 import argparse
-import json
 import os
 import shutil
 import sys
@@ -13,6 +12,8 @@ from . import __version__
 # During a split the raw download and the shards are on disk at the same time,
 # so peak usage is roughly twice the checkpoint size.
 PEAK_FACTOR = 2.1
+
+NEXT_STEP = "run the installer to add PyTorch:  curl -fsSL https://raw.githubusercontent.com/david-here-llma/OpenLLM/main/get.sh | bash"
 
 
 def home():
@@ -34,7 +35,7 @@ def installed(entry):
 
 
 def log(message):
-    print("  " + message, flush=True)
+    print("  " + str(message), flush=True)
 
 
 def disk_free():
@@ -50,6 +51,15 @@ def human_gb(value):
 
 def peak_bytes(entry):
     return entry.approx_gb * 1e9 * PEAK_FACTOR
+
+
+def confirm(question):
+    try:
+        answer = input("  %s? [Y/n] " % question).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in ("", "y", "yes")
 
 
 # --------------------------------------------------------------------------- list
@@ -81,7 +91,7 @@ def cmd_list(args):
 def pick(only_installed=False):
     entries = [e for e in catalog.CATALOG if installed(e)] if only_installed else list(catalog.CATALOG)
     if not entries:
-        log("no models installed yet - run: openllm list")
+        log("no models installed yet - run: openllm pull <key>")
         return None
 
     free = disk_free()
@@ -122,8 +132,8 @@ def cmd_pull(args):
 
     dest = model_dir(entry)
     if installed(entry) and not args.force:
-        log("%s is already installed in %s" % (entry.label, dest))
-        log("use --force to re-download and re-split it")
+        log("%s is already installed" % entry.label)
+        log("use --force to download and split it again")
         return 0
 
     free = disk_free()
@@ -134,21 +144,23 @@ def cmd_pull(args):
         return 1
 
     staging = home() / "downloads" / catalog.slug_for(entry.repo)
+    log("fetching %s from huggingface.co" % entry.repo)
     try:
         splitter.download(entry.repo, staging, progress=log)
     except Exception as exc:
-        name = type(exc).__name__
-        if "Gated" in name or "401" in str(exc) or "403" in str(exc):
-            log("this repo is gated; accept the licence on the HF page, then set HF_TOKEN")
+        message = str(exc) or type(exc).__name__
+        if isinstance(exc, ModuleNotFoundError):
+            log("missing dependency: %s" % message)
+            log("update the checkout:  cd %s && git pull" % home())
         else:
-            log("download failed: %s: %s" % (name, exc))
+            log(message)
         return 1
 
     try:
         manifest = splitter.split(entry.repo, staging, dest,
                                   keep_source=args.keep_source, progress=log)
     except Exception as exc:
-        log("split failed: %s: %s" % (type(exc).__name__, exc))
+        log("split failed: %s" % (str(exc) or type(exc).__name__))
         return 1
 
     log("done: %d layers, %s" % (manifest["layers"], human_gb(manifest["total_bytes"])))
@@ -172,11 +184,7 @@ def runtime_ok():
 def cmd_chat(args):
     entry = None
     if args.model:
-        try:
-            entry = catalog.lookup(args.model)
-        except KeyError as exc:
-            log(str(exc))
-            return 1
+        entry = catalog.lookup(args.model)
     else:
         entry = pick(only_installed=True)
         if entry is None:
@@ -189,8 +197,9 @@ def cmd_chat(args):
     missing = runtime_ok()
     if missing or args.mock:
         if missing:
-            log("real runtime unavailable: " + ", ".join(missing))
-        log("falling back to the simulated backend (shards are ignored)")
+            log("PyTorch runtime missing: " + ", ".join(missing))
+            log(NEXT_STEP)
+        log("showing the simulated backend for now (real shards are not read)")
         from . import mock
         return mock.chat(entry.label, args.max_new_tokens)
 
@@ -198,7 +207,7 @@ def cmd_chat(args):
     from .ui import Renderer
 
     target = model_dir(entry)
-    log("building skeleton from %d shards" % len(list(target.glob("layer_*.safetensors"))))
+    log("building skeleton from %d layer shards" % len(list(target.glob("layer_*.safetensors"))))
     streamer = LayerStreamer(
         target,
         device=args.device,
@@ -208,7 +217,7 @@ def cmd_chat(args):
     try:
         streamer.build()
     except Exception as exc:
-        log("could not build the model: %s: %s" % (type(exc).__name__, exc))
+        log("could not build the model: %s" % (str(exc) or type(exc).__name__))
         return 1
 
     log("ready - %d layers, device %s, dtype %s" % (
@@ -236,17 +245,20 @@ def cmd_chat(args):
         view = Renderer(streamer.layer_count, entry.label, args.max_new_tokens)
         with view:
             view.set_phase("prefill")
-            for event in streamer.stream(
-                messages,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-            ):
-                if event.type == "layer_start":
-                    view.on_layer(event.index)
-                elif event.type == "token":
-                    view.on_token(event.text)
-                elif event.type == "error":
-                    error = event.text
+            try:
+                for event in streamer.stream(
+                    messages,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                ):
+                    if event.type == "layer_start":
+                        view.on_layer(event.index)
+                    elif event.type == "token":
+                        view.on_token(event.text)
+                    elif event.type == "error":
+                        error = event.text
+            except Exception as exc:
+                error = str(exc) or type(exc).__name__
             view.set_phase("done")
 
         if error:
@@ -287,7 +299,7 @@ def cmd_doctor(args):
             log("%-16s %s" % (name, getattr(module, "__version__", "?")))
         except Exception as exc:
             log("%-16s MISSING (%s)" % (name, type(exc).__name__))
-    log("HF_TOKEN %s" % ("set" if os.environ.get("HF_TOKEN") else "not set (needed for gated repos)"))
+    log("HF_TOKEN %s" % ("set" if os.environ.get("HF_TOKEN") else "not set (only needed for gated repos)"))
     try:
         import torch
         log("device %s" % ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -295,6 +307,9 @@ def cmd_doctor(args):
         pass
     found = [p.name for p in models_dir().iterdir() if (p / splitter.MANIFEST).exists()]
     log("installed %s" % (", ".join(found) if found else "none"))
+    print()
+    log("note: pulling and splitting need only the standard library;")
+    log("      chatting needs torch, which lives in the linux sandbox.")
     print()
     return 0
 
@@ -304,18 +319,25 @@ def cmd_doctor(args):
 
 def interactive():
     entries = [e for e in catalog.CATALOG if installed(e)]
-    if not entries:
-        log("no models installed - showing the catalog")
+    if entries:
+        entry = pick(only_installed=True)
+    else:
+        log("no models installed yet - pick one to download")
         cmd_list(None)
         entry = pick()
         if entry is None:
-            log("run 'openllm pull <key>' to download one")
             return 1
-        if not installed(entry):
+        if installed(entry):
+            pass
+        elif confirm("download and split %s (%0.2f GB)" % (entry.label, entry.approx_gb)):
+            code = cmd_pull(argparse.Namespace(
+                model=entry.key, force=False, keep_source=False))
+            if code != 0:
+                return code
+        else:
             log("then: openllm pull %s" % entry.key)
             return 1
-    else:
-        entry = pick(only_installed=True)
+
     if entry is None:
         return 1
 
@@ -358,6 +380,13 @@ def main(argv=None):
     sub.add_parser("doctor", help="check the runtime").set_defaults(func=cmd_doctor)
 
     args = parser.parse_args(argv)
-    if getattr(args, "command", None) is None:
-        return interactive()
-    return args.func(args)
+    try:
+        if getattr(args, "command", None) is None:
+            return interactive()
+        return args.func(args)
+    except catalog.UnknownModel as exc:
+        log(str(exc).strip('"'))
+        return 1
+    except KeyboardInterrupt:
+        print()
+        return 130
