@@ -1,41 +1,26 @@
 """Download a Hugging Face checkpoint and split it into per-layer shards.
 
-This is the real thing: ``split()`` reads the safetensors index, groups
-every tensor by its transformer layer (``layers.N.`` / ``h.N.``), and
-writes one file per layer plus ``embed``, ``head`` and ``other`` groups,
-with a ``manifest.json`` describing the result.
+Pure standard library.  A safetensors file is a tiny JSON header followed
+by raw tensor bytes, so sharding is just: parse each header, regroup the
+tensor entries by layer, then stream the byte ranges into new files with
+rebased offsets.  No torch, no safetensors package, no numpy - which is
+what makes ``openllm pull`` work on a phone.
 """
 
 import json
 import re
 import shutil
+import struct
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import hub
+
 MANIFEST = "manifest.json"
 FORMAT = "openllm-layer-shard-v1"
-INDEX_FILE = "model.safetensors.index.json"
-SINGLE_FILE = "model.safetensors"
 
-HUB_PATTERNS = [
-    "*.json",
-    "*.safetensors",
-    "*.model",
-    "*.txt",
-    "*.jinja",
-    "tokenizer*",
-    "special_tokens*",
-]
-IGNORE_PATTERNS = [
-    "*.bin",
-    "*.h5",
-    "*.msgpack",
-    "*.gguf",
-    "*.onnx",
-    "*.onnx_data",
-    "consolidated*",
-    "*.pth",
-]
+TEXT_SUFFIXES = (".json", ".txt", ".model", ".jinja")
+SKIP_TEXT = ("model.safetensors.index.json", MANIFEST)
 
 _LAYER_RE = re.compile(r"(?:^|\.)(?:layers|h)\.(\d+)\.")
 
@@ -62,102 +47,113 @@ def bucket(name):
 # --------------------------------------------------------------------------- download
 
 
-def download(repo, dest, token=None, revision=None, progress=None):
-    """Fetch only the files we need (safetensors + config + tokenizer)."""
-    from huggingface_hub import snapshot_download
-
-    say = progress or (lambda msg: None)
+def download(repo, dest, token=None, progress=None):
+    """Fetch only the safetensors, config and tokenizer files."""
+    say = progress or (lambda message: None)
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
-    say("downloading %s from huggingface.co" % repo)
-    return snapshot_download(
-        repo_id=repo,
-        revision=revision,
-        token=token,
-        local_dir=str(dest),
-        allow_patterns=HUB_PATTERNS,
-        ignore_patterns=IGNORE_PATTERNS,
-    )
+    files = hub.list_files(repo, token_value=token)
+    say("found %d files in %s" % (len(files), repo))
+    hub.download(repo, files, dest, token_value=token, progress=say)
+    return dest
 
 
-# --------------------------------------------------------------------------- index
+# --------------------------------------------------------------------------- safetensors
 
 
-def weight_files(source):
+def read_header(path):
+    """Return (header dict, byte offset where tensor data starts)."""
+    with open(path, "rb") as handle:
+        prefix = handle.read(8)
+        if len(prefix) != 8:
+            raise IOError("%s is too small to be safetensors" % path)
+        size = struct.unpack("<Q", prefix)[0]
+        if size <= 0 or size > 200 * 1024 * 1024:
+            raise IOError("implausible safetensors header in %s" % path)
+        raw = handle.read(size)
+    header = json.loads(raw.decode("utf-8"))
+    return header, 8 + size
+
+
+def pack_header(header):
+    body = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    body += b" " * ((-len(body)) % 8)
+    return struct.pack("<Q", len(body)) + body
+
+
+def scan(source):
+    """Map every tensor name to its location, without reading tensor data."""
     source = Path(source)
-    index = source / INDEX_FILE
-    if index.exists():
-        data = json.loads(index.read_text(encoding="utf-8"))
-        files = sorted({source / name for name in data.get("weight_map", {}).values()})
-        if files:
-            return files
-    single = source / SINGLE_FILE
-    if single.exists():
-        return [single]
-    found = sorted(source.glob("*.safetensors"))
-    if not found:
-        raise FileNotFoundError("no .safetensors weights inside %s" % source)
-    return found
+    files = sorted(source.glob("*.safetensors"))
+    if not files:
+        raise FileNotFoundError("no .safetensors files in %s" % source)
 
-
-def key_map(files):
-    """Map every tensor name to the archive that holds it, without loading data."""
-    from safetensors import safe_open
-
-    mapping = {}
+    info = {}
+    metadata = None
     for path in files:
-        with safe_open(str(path), framework="pt", device="cpu") as handle:
-            for key in handle.keys():
-                mapping[key] = path
-    return mapping
+        header, data_start = read_header(path)
+        meta = header.pop("__metadata__", None)
+        if meta and metadata is None:
+            metadata = meta
+        for name, entry in header.items():
+            begin, end = entry.get("data_offsets", (0, 0))
+            if end < begin:
+                raise IOError("bad data offsets for %s in %s" % (name, path))
+            info[name] = {
+                "path": path,
+                "offset": data_start + begin,
+                "length": end - begin,
+                "dtype": entry.get("dtype", "F32"),
+                "shape": entry.get("shape", []),
+            }
+    return info, metadata, files
 
 
-def _write_group(mapping, names, out_path):
-    from safetensors import safe_open
-    from safetensors.torch import save_file
+def write_shard(names, info, out_path, metadata=None):
+    header = {}
+    if metadata:
+        header["__metadata__"] = metadata
 
-    by_file = {}
+    cursor = 0
     for name in names:
-        by_file.setdefault(mapping[name], []).append(name)
+        item = info[name]
+        header[name] = {
+            "dtype": item["dtype"],
+            "shape": item["shape"],
+            "data_offsets": [cursor, cursor + item["length"]],
+        }
+        cursor += item["length"]
 
-    tensors = {}
-    for path, keys in by_file.items():
-        with safe_open(str(path), framework="pt", device="cpu") as handle:
-            for key in keys:
-                tensors[key] = handle.get_tensor(key).contiguous()
+    with open(out_path, "wb") as dst:
+        dst.write(pack_header(header))
+        for name in names:
+            item = info[name]
+            with open(item["path"], "rb") as src:
+                src.seek(item["offset"])
+                remaining = item["length"]
+                while remaining > 0:
+                    chunk = src.read(min(1 << 20, remaining))
+                    if not chunk:
+                        raise IOError("unexpected end of %s" % item["path"])
+                    dst.write(chunk)
+                    remaining -= len(chunk)
 
-    save_file(tensors, str(out_path))
-    size = out_path.stat().st_size
-    del tensors
-    return size
-
-
-def _dtype_of(mapping, names):
-    from safetensors import safe_open
-
-    key = sorted(names)[0]
-    try:
-        with safe_open(str(mapping[key]), framework="pt", device="cpu") as handle:
-            return str(handle.get_slice(key).get_dtype())
-    except Exception:
-        return "unknown"
+    return out_path.stat().st_size
 
 
 # --------------------------------------------------------------------------- split
 
 
 def split(repo, source, dest, keep_source=False, progress=None):
-    """Split ``source`` (a HF snapshot) into layer shards under ``dest``."""
-    say = progress or (lambda msg: None)
+    say = progress or (lambda message: None)
     source, dest = Path(source), Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
 
-    files = weight_files(source)
-    say("indexing %d weight archive(s)" % len(files))
-    mapping = key_map(files)
+    info, metadata, weight_files = scan(source)
+    say("indexed %d tensors across %d file(s)" % (len(info), len(weight_files)))
 
     groups = {}
-    for name in mapping:
+    for name in info:
         groups.setdefault(bucket(name), []).append(name)
 
     layer_ids = sorted(int(g.split(":")[1]) for g in groups if g.startswith("layer:"))
@@ -173,7 +169,7 @@ def split(repo, source, dest, keep_source=False, progress=None):
         "repo": repo,
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "layers": len(layer_ids),
-        "tensors": len(mapping),
+        "tensors": len(info),
         "layer_bytes": [],
         "dtype": None,
         "files": {},
@@ -185,6 +181,8 @@ def split(repo, source, dest, keep_source=False, progress=None):
         names = groups.get(group)
         if not names:
             continue
+        names.sort()
+
         if group.startswith("layer:"):
             index = int(group.split(":")[1])
             out = dest / ("layer_%02d.safetensors" % index)
@@ -194,26 +192,25 @@ def split(repo, source, dest, keep_source=False, progress=None):
             manifest["files"][group] = out.name
 
         say("writing %s (%d tensors)" % (out.name, len(names)))
-        size = _write_group(mapping, names, out)
+        size = write_shard(names, info, out, metadata)
         total += size
         if manifest["dtype"] is None:
-            manifest["dtype"] = _dtype_of(mapping, names)
+            manifest["dtype"] = info[names[0]]["dtype"]
         if group.startswith("layer:"):
             manifest["layer_bytes"].append(size)
 
     manifest["total_bytes"] = total
 
-    for pattern in ("*.json", "*.txt", "*.model", "*.jinja"):
-        for path in source.glob(pattern):
-            if path.name in (INDEX_FILE, MANIFEST):
-                continue
+    for path in source.iterdir():
+        if not path.is_file():
+            continue
+        if path.suffix in TEXT_SUFFIXES and path.name not in SKIP_TEXT:
             shutil.copy2(path, dest / path.name)
 
     (dest / MANIFEST).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     say("wrote %d layer shards, %.2f GB total" % (len(layer_ids), total / 1e9))
 
     if not keep_source:
-        say("removing the original download in %s" % source)
         shutil.rmtree(source, ignore_errors=True)
 
     return manifest

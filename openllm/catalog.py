@@ -6,6 +6,7 @@ equivalent) without architecture-specific code.  Entries marked ``gated``
 need ``HF_TOKEN`` set to a token that has accepted the licence.
 """
 
+import difflib
 from dataclasses import dataclass
 
 MAX_PARAMS_B = 70.0
@@ -44,19 +45,35 @@ CATALOG = (
 
 BY_KEY = {entry.key: entry for entry in CATALOG}
 BY_REPO = {entry.repo: entry for entry in CATALOG}
+_LOWER_KEY = {entry.key.lower(): entry for entry in CATALOG}
+_LOWER_REPO = {entry.repo.lower(): entry for entry in CATALOG}
+
+
+class UnknownModel(KeyError):
+    pass
 
 
 def lookup(name):
-    """Resolve a catalog key or a raw ``owner/repo`` id to an Entry."""
-    name = (name or "").strip()
-    if name in BY_KEY:
-        return BY_KEY[name]
-    if name in BY_REPO:
-        return BY_REPO[name]
-    if "/" in name:
-        slug = name.replace("/", "__")
-        return Entry(slug, name, name, 0.0, 0.0)
-    raise KeyError("unknown model %r (try: openllm list)" % name)
+    """Resolve a catalog key or a raw ``owner/repo`` id, case-insensitively."""
+    raw = (name or "").strip()
+    if not raw:
+        raise UnknownModel("no model given (try: openllm list)")
+
+    for table in (BY_KEY, _LOWER_KEY, BY_REPO, _LOWER_REPO):
+        if raw in table:
+            return table[raw]
+
+    low = raw.lower()
+    for table in (BY_KEY, _LOWER_KEY, BY_REPO, _LOWER_REPO):
+        if low in table:
+            return table[low]
+
+    if "/" in raw:
+        return Entry(raw.replace("/", "__"), raw, raw, 0.0, 0.0)
+
+    close = difflib.get_close_matches(low, list(_LOWER_KEY), n=3, cutoff=0.5)
+    hint = (" - did you mean: " + ", ".join(close)) if close else ""
+    raise UnknownModel("unknown model %r%s (try: openllm list)" % (raw, hint))
 
 
 def slug_for(repo):
