@@ -49,12 +49,27 @@ else
   mkdir -p "$BIN"
 fi
 
-printf '#!/usr/bin/env bash\nexec python3 "%s/openllm.py" "$@"\n' "$DEST" > "$BIN/openllm"
+printf '#!/usr/bin/env bash\nexport PYTHONPATH="%s${PYTHONPATH:+:$PYTHONPATH}"\nexec python3 -m openllm "$@"\n' "$DEST" > "$BIN/openllm"
 chmod +x "$BIN/openllm"
 note "wrote $BIN/openllm"
 
+if [ "${OPENLLM_SKIP_DEPS:-0}" = "1" ]; then
+  warn "skipping Python dependencies (OPENLLM_SKIP_DEPS=1)"
+else
+  step "Installing Python dependencies"
+  python3 -m pip install --upgrade pip >/dev/null 2>&1 || true
+  if python3 -m pip install -r "$DEST/requirements.txt"; then
+    note "torch, transformers, accelerate, safetensors, huggingface_hub ready"
+  else
+    warn "dependency install failed"
+    note "plain Termux has no PyTorch wheel; use proot-distro (Ubuntu) or a desktop"
+    note "the CLI still runs: 'openllm list' works and 'openllm chat --mock' works"
+  fi
+fi
+
 step "Ready"
-note "start it with:  openllm"
+note "openllm list      # catalog, smallest to 70B"
+note "openllm doctor    # what is installed"
 case ":$PATH:" in
   *":$BIN:"*) ;;
   *) warn "add this to your shell profile: export PATH=\"$BIN:\$PATH\"" ;;

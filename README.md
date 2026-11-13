@@ -1,87 +1,104 @@
 # OpenLLM
 
-A mock terminal runtime that previews how **OpenLLM** will look on a phone: layer-by-layer
-streaming, a live elapsed timer, and a completion percentage.
-
-> **This is a UI mockup.** No model weights are downloaded or loaded and no inference runs.
-> Every token and every timing you see is generated locally by a simulation.
-
-Built to be readable on a small Termux screen and to run on a 8 GB Android device.
-
-## What you see
+Layer-streamed inference for Hugging Face models. Instead of holding a whole
+checkpoint in memory, OpenLLM splits it into one shard per transformer layer and
+loads exactly one layer at a time while it runs.
 
 ```
-  OpenLLM  mock runtime | qwen3-mock-7b | 28 layers
+  OpenLLM  Qwen2.5 3B | 36 layers | real shards
   ----------------------------------------------
 
-  you    what can you do
+  The capital of France is Paris, which has been
+  the country's centre since...
 
-  <reply text streams in here>
+  ▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱
 
-  ▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱
-
-  elapsed  12.4s  ██████░░░░░░░░░░░░  34%  18/52 tok
-  decode ⠹  layer 9/28
+  elapsed   8.2s  ████░░░░░░░░░░  22%  56/256 tok
+  decode ⠹  layer 13/36  6.8 tok/s
 ```
 
-- **Layer boxes** - one box per transformer layer. Each pass fills them left to right,
-  bright yellow for the layer being computed and green for the ones already done.
-- **elapsed** - live wall-clock timer for the current message, in seconds then `m:ss`.
-- **percent** - how much of the reply has been emitted, next to the token counter.
-- **phase** - `prefill` while the prompt is being read, `decode` while tokens stream,
-  `done` when the pass finishes.
+Each box is a real transformer layer. It turns green when that shard has been
+loaded, run, and released - the row is driven by forward hooks, not a timer.
 
-The animation runs in the terminal's alternate screen, so your scrollback stays clean:
-when a reply finishes it is printed normally and stays there.
+## What is real
 
-## Install (Termux)
+| Piece | Status |
+| --- | --- |
+| `openllm pull` - downloads safetensors from the Hub | real |
+| `openllm/splitter.py` - groups tensors by layer, writes one file per layer + manifest | real |
+| `openllm/runner.py` - meta skeleton, per-layer load / run / release via hooks | real |
+| `openllm/ui.py` - boxes, timer, percentage, tok/s | real, driven by runner events |
+| `openllm/mock.py` - simulated tokens when torch is missing | mock |
+
+## Install
 
 ```bash
 pkg update -y && pkg install -y python git curl
 curl -fsSL https://raw.githubusercontent.com/david-here-llma/OpenLLM/main/install.sh | bash
-openllm
+openllm doctor
 ```
 
-Or clone it yourself:
+Or by hand:
 
 ```bash
 git clone https://github.com/david-here-llma/OpenLLM.git ~/.openllm
-python3 ~/.openllm/openllm.py
+export PYTHONPATH="$HOME/.openllm:$PYTHONPATH"
+python3 -m openllm list
 ```
 
-There are no third-party Python dependencies - standard library only.
+### Termux caveat
+
+PyTorch has no official wheel for Android/aarch64, so `pip install torch` fails in
+plain Termux. The CLI itself works (`list`, `doctor`, `chat --mock`), but real
+inference needs one of:
+
+- `pkg install proot-distro && proot-distro install ubuntu`, then run OpenLLM inside Ubuntu
+- a Linux desktop with the same commands
+
+The layer splitting itself only needs `safetensors` + `torch`.
 
 ## Commands
 
-| Command | What it does |
-| --- | --- |
-| `/help` | list commands |
-| `/stats` | timings of the last run |
-| `/clear` | clear the screen |
-| `/exit` | quit |
-
-## Flags
-
 ```bash
-openllm --layers 40 --model my-model --speed 2
+openllm list                 # catalog, 135M up to 70B
+openllm pull qwen2.5-3b      # download + split into layer shards
+openllm chat qwen2.5-3b      # stream a reply, one layer at a time
+openllm chat                 # pick from what is installed
+openllm rm qwen2.5-3b
+openllm doctor
 ```
 
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `--layers` | `28` | number of layer boxes |
-| `--model` | `qwen3-mock-7b` | label in the header |
-| `--speed` | `1.0` | animation speed multiplier |
+Chat flags: `--device cpu|cuda`, `--dtype auto|float32|float16|bfloat16`,
+`--max-new-tokens 256`, `--temperature 0.7`, `--mock`.
 
-## Notes
+In chat: `/clear` resets history, `/exit` quits.
 
-- Needs a real TTY for the animation; when output is piped it prints plain text instead.
-- Tested on a phone-sized terminal (about 40x30); it also lays out at 80 columns.
-- Android may freeze background Termux sessions - run `termux-wake-lock` if a long run stalls.
+## Where things go
 
-## Roadmap
+```
+~/.openllm/models/<owner>__<repo>/
+    manifest.json          layer count, byte sizes, tensor totals
+    layer_00.safetensors   one file per transformer layer
+    embed.safetensors  head.safetensors  other.safetensors
+    config.json  tokenizer*  ...
+```
 
-1. Swap the simulated token stream for a real `llama.cpp` / AirLLM style backend.
-2. Report real per-layer timings instead of shaped ones.
-3. A real tokenizer so the token counter matches the model.
+Set `OPENLLM_HOME` to move that tree. Set `HF_TOKEN` for gated repos
+(Llama, Mistral).
+
+## Supported models
+
+The catalog covers standard decoder architectures that expose `model.layers`
+(Qwen2/2.5, Llama 3.x, Mistral, SmolLM2, Phi-3.5) or `transformer.h` (GPT-2
+family). `openllm pull owner/repo` also accepts any other repo, but the split
+needs a recognisable `layers.N.` tensor naming scheme.
+
+## Honest status
+
+This is a first real cut, written without a test run: the machine it was built on
+was unreachable, so nothing here has been executed end to end. The design is
+sound (meta skeleton plus per-parameter assignment from shards avoids the usual
+`to_empty` buffer bug), but expect to debug the first `openllm pull` on your own
+hardware - open an issue with the traceback.
 
 MIT licensed.
