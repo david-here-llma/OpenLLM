@@ -20,51 +20,38 @@ loads exactly one layer at a time while it runs.
 Each box is a real transformer layer. It turns green when that shard has been
 loaded, run, and released - the row is driven by forward hooks, not a timer.
 
-## What is real
-
-| Piece | Status |
-| --- | --- |
-| `openllm pull` - downloads safetensors from the Hub | real |
-| `openllm/splitter.py` - groups tensors by layer, writes one file per layer + manifest | real |
-| `openllm/runner.py` - meta skeleton, per-layer load / run / release via hooks | real |
-| `openllm/ui.py` - boxes, timer, percentage, tok/s | real, driven by runner events |
-| `openllm/mock.py` - simulated tokens when torch is missing | mock |
-
-## Install
+## Install: one command
 
 ```bash
-pkg update -y && pkg install -y python git curl
-curl -fsSL https://raw.githubusercontent.com/david-here-llma/OpenLLM/main/install.sh | bash
-openllm doctor
+curl -fsSL https://raw.githubusercontent.com/david-here-llma/OpenLLM/main/get.sh | bash
 ```
 
-Or by hand:
+That single command installs everything and then starts OpenLLM:
+
+- on **Termux**: git/curl/proot-distro, then an Ubuntu sandbox, then python,
+  torch, transformers and accelerate inside it
+- on **Linux**: system packages, then a venv with torch and transformers
+- writes the `openllm` command
+- launches the app
+
+Afterwards, forever after:
 
 ```bash
-git clone https://github.com/david-here-llma/OpenLLM.git ~/.openllm
-export PYTHONPATH="$HOME/.openllm:$PYTHONPATH"
-python3 -m openllm list
+openllm
 ```
 
-### Termux caveat
+Re-running the install command is safe - every step is skipped if it is already
+done, so it doubles as a repair command. First run takes 5-15 minutes because
+PyTorch is a few hundred MB.
 
-PyTorch has no official wheel for Android/aarch64, so `pip install torch` fails in
-plain Termux. The CLI itself works (`list`, `doctor`, `chat --mock`), but real
-inference needs one of:
-
-- `pkg install proot-distro && proot-distro install ubuntu`, then run OpenLLM inside Ubuntu
-- a Linux desktop with the same commands
-
-The layer splitting itself only needs `safetensors` + `torch`.
-
-## Commands
+## Use
 
 ```bash
 openllm list                 # catalog, 135M up to 70B
-openllm pull qwen2.5-3b      # download + split into layer shards
-openllm chat qwen2.5-3b      # stream a reply, one layer at a time
+openllm pull qwen2.5-0.5b    # download + split into layer shards
+openllm chat qwen2.5-0.5b    # stream a reply, one layer at a time
 openllm chat                 # pick from what is installed
-openllm rm qwen2.5-3b
+openllm rm qwen2.5-0.5b
 openllm doctor
 ```
 
@@ -72,6 +59,23 @@ Chat flags: `--device cpu|cuda`, `--dtype auto|float32|float16|bfloat16`,
 `--max-new-tokens 256`, `--temperature 0.7`, `--mock`.
 
 In chat: `/clear` resets history, `/exit` quits.
+
+Start small - 0.5B to 1.5B on a phone. `pull` needs about twice the model size
+free (raw download and shards coexist during the split).
+
+Gated repos (Llama, Mistral) need `export HF_TOKEN=...` after accepting the
+licence on the model page.
+
+## What is real
+
+| Piece | Status |
+| --- | --- |
+| `openllm pull` - downloads safetensors from the Hub | real |
+| `openllm/splitter.py` - groups tensors by layer, one file per layer + manifest | real |
+| `openllm/runner.py` - meta skeleton, per-layer load / run / release via hooks | real |
+| `openllm/ui.py` - boxes, timer, percentage, tok/s | real, driven by runner events |
+| `openllm/mock.py` - simulated tokens when torch is missing | mock |
+| `get.sh` - one-command installer | real |
 
 ## Where things go
 
@@ -83,22 +87,32 @@ In chat: `/clear` resets history, `/exit` quits.
     config.json  tokenizer*  ...
 ```
 
-Set `OPENLLM_HOME` to move that tree. Set `HF_TOKEN` for gated repos
-(Llama, Mistral).
+Set `OPENLLM_HOME` to move that tree.
+
+## Manual install
+
+If you already have torch and transformers, skip `get.sh`:
+
+```bash
+git clone https://github.com/david-here-llma/OpenLLM.git ~/OpenLLM
+pip install -r ~/OpenLLM/requirements.txt
+export PYTHONPATH="$HOME/OpenLLM:$PYTHONPATH"
+python3 -m openllm list
+```
 
 ## Supported models
 
-The catalog covers standard decoder architectures that expose `model.layers`
+The catalog covers decoder architectures that expose `model.layers`
 (Qwen2/2.5, Llama 3.x, Mistral, SmolLM2, Phi-3.5) or `transformer.h` (GPT-2
-family). `openllm pull owner/repo` also accepts any other repo, but the split
-needs a recognisable `layers.N.` tensor naming scheme.
+family). `openllm pull owner/repo` accepts any other repo, but the split needs a
+recognisable `layers.N.` tensor naming scheme.
 
 ## Honest status
 
-This is a first real cut, written without a test run: the machine it was built on
-was unreachable, so nothing here has been executed end to end. The design is
-sound (meta skeleton plus per-parameter assignment from shards avoids the usual
-`to_empty` buffer bug), but expect to debug the first `openllm pull` on your own
-hardware - open an issue with the traceback.
+Written without a test run: the machine it was built on was unreachable, so no
+part of this has been executed end to end. The design is deliberate (meta
+skeleton plus per-parameter assignment from shards, which avoids the usual
+`to_empty` buffer bug), and the installer is idempotent, but expect to debug the
+first `openllm pull` on your own hardware - open an issue with the traceback.
 
 MIT licensed.
