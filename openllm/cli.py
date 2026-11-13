@@ -10,6 +10,10 @@ from pathlib import Path
 from . import catalog, splitter
 from . import __version__
 
+# During a split the raw download and the shards are on disk at the same time,
+# so peak usage is roughly twice the checkpoint size.
+PEAK_FACTOR = 2.1
+
 
 def home():
     return Path(os.environ.get("OPENLLM_HOME") or (Path.home() / ".openllm"))
@@ -44,6 +48,10 @@ def human_gb(value):
     return "%.2f GB" % (value / 1e9)
 
 
+def peak_bytes(entry):
+    return entry.approx_gb * 1e9 * PEAK_FACTOR
+
+
 # --------------------------------------------------------------------------- list
 
 
@@ -54,7 +62,7 @@ def cmd_list(args):
     print("  " + "-" * 76)
     for entry in catalog.CATALOG:
         state = "installed" if installed(entry) else ("gated" if entry.gated else "-")
-        if entry.approx_gb * 1e9 > free and not installed(entry):
+        if not installed(entry) and peak_bytes(entry) > free:
             state += ", low disk"
         print("  %-3s %-18s %-34s %9.2f  %s" % (
             "*" if installed(entry) else " ", entry.key, entry.repo,
@@ -62,6 +70,7 @@ def cmd_list(args):
     print()
     print("  models live in %s" % models_dir())
     print("  free disk: %s   max size: %.0fB params" % (human_gb(free), catalog.MAX_PARAMS_B))
+    print("  (downloading needs about 2x the size: raw download + shards)")
     print()
     return 0
 
@@ -96,8 +105,8 @@ def pick(only_installed=False):
             log("pick a number between 1 and %d" % len(entries))
             continue
         entry = entries[int(raw) - 1]
-        if not installed(entry) and entry.approx_gb * 1e9 > free:
-            log("not enough disk: need about %.2f GB" % entry.approx_gb)
+        if not installed(entry) and peak_bytes(entry) > free:
+            log("not enough disk: about %s needed while splitting" % human_gb(peak_bytes(entry)))
             continue
         return entry
 
@@ -118,9 +127,9 @@ def cmd_pull(args):
         return 0
 
     free = disk_free()
-    need = entry.approx_gb * 1e9 * 1.15
+    need = peak_bytes(entry)
     if need > free and not args.force:
-        log("need about %s free, only %s available" % (human_gb(need), human_gb(free)))
+        log("need about %s free while splitting, only %s available" % (human_gb(need), human_gb(free)))
         log("pass --force to try anyway")
         return 1
 
@@ -202,7 +211,7 @@ def cmd_chat(args):
         log("could not build the model: %s: %s" % (type(exc).__name__, exc))
         return 1
 
-    log("ready - layer %d, device %s, dtype %s" % (
+    log("ready - %d layers, device %s, dtype %s" % (
         streamer.layer_count, args.device, streamer.dtype))
 
     messages = []
@@ -294,8 +303,6 @@ def cmd_doctor(args):
 
 
 def interactive():
-    from . import mock
-
     entries = [e for e in catalog.CATALOG if installed(e)]
     if not entries:
         log("no models installed - showing the catalog")
